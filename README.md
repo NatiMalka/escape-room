@@ -1,36 +1,112 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Haunted Tech Lab - Team vs Team Escape Room
+
+A horror-themed escape room web application where teams compete against each other to solve tech puzzles using a realistic terminal interface to escape the haunted laboratory.
+
+## Features
+
+- Team vs Team gameplay (1-7 players per team)
+- Horror theme with tech puzzles
+- Interactive terminal interface with command responses
+- Real-time competition
+- Score tracking and results page
 
 ## Getting Started
 
-First, run the development server:
+### Prerequisites
 
+- Node.js (v18 or later recommended)
+- npm or yarn
+
+### Installation
+
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd escap-room
+```
+
+2. Install dependencies:
+```bash
+npm install
+# or
+yarn
+```
+
+3. Run the development server:
 ```bash
 npm run dev
 # or
 yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+4. Open [http://localhost:3000](http://localhost:3000) in your browser to see the application.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## How to Play
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. **Home Page**: Start by clicking "START GAME" on the home page.
 
-## Learn More
+2. **Team Setup**: Enter names for both teams and the number of players (1-7) for each team.
 
-To learn more about Next.js, take a look at the following resources:
+3. **Lobby**: Review game instructions and prepare your teams.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+4. **Gameplay**: Teams take turns solving puzzles by typing commands into the terminal. The goal is to solve all puzzles and escape the lab!
+   - Type commands and press Enter to submit
+   - Read feedback from the terminal carefully
+   - Use the hint button if you're stuck
+   - Common commands: help, ls, cat, chmod, etc.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+5. **Results**: See which team escaped first and view game statistics.
 
-## Deploy on Vercel
+## Terminal Commands
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+The game features a realistic terminal interface where players can:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Use standard Linux/Unix commands (`ls`, `cd`, `cat`, etc.)
+- Decode binary messages
+- Execute scripts with parameters
+- Solve mathematical puzzles
+
+The terminal will respond differently based on your input, with specific commands providing valuable clues.
+
+## Customization
+
+### Adding New Puzzles
+
+To add new puzzles, edit the `puzzles` array in `src/app/game/page.tsx`. Each puzzle should follow this format:
+
+```typescript
+{
+  id: number,
+  title: string,
+  description: string,
+  initialOutput: string[],  // Lines displayed in terminal at start
+  expectedInput: string,    // The correct answer
+  acceptableInputs: string[], // All acceptable variations of the answer
+  hint: string,
+  incorrectResponses: string[], // Error messages for wrong answers
+  specificResponses?: {    // Optional specific responses to commands
+    [command: string]: string
+  }
+}
+```
+
+### Changing Theme
+
+The horror theme can be customized by editing the CSS classes in the components and updating the theme-related text content.
+
+## Image Credits
+
+For the complete experience, add a horror-themed lab image named `haunted-lab.jpg` to the `public` directory.
+
+## License
+
+This project is open source and available under the [MIT License](LICENSE).
+
+## Future Enhancements
+
+- More puzzle types and terminal commands
+- Sound effects for terminal feedback
+- Multiplayer support via websockets
+- Additional themes
+- Enhanced animations and effects
+- Timer penalties for incorrect answers
