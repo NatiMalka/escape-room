@@ -1,0 +1,1113 @@
+From f17d31564fe75a51151951463b070d914ccf935f Mon Sep 17 00:00:00 2001
+From: netanel <netamal3134@gmail.com>
+Date: Sun, 11 May 2025 03:59:39 +0300
+Subject: [PATCH 1/2] Fix user flow issues between pages: 1. Auto join room
+ when coming from setup page 2. Improve join flow from home page 3. Add
+ TypeScript interfaces for consistent data handling
+
+---
+ server.js                    |  40 ++++
+ src/app/lobby/page.tsx       | 437 +++++++++++++++++++++++------------
+ src/app/page.tsx             | 281 +++++++++++-----------
+ src/context/SocketContext.js |  44 +++-
+ 4 files changed, 507 insertions(+), 295 deletions(-)
+
+diff --git a/server.js b/server.js
+index 86b12ca..bb9321c 100644
+--- a/server.js
++++ b/server.js
+@@ -70,6 +70,7 @@ app.prepare().then(() => {
+             name: playerName,
+             socketId: socket.id,
+             isLeader: false,
++            isReady: false,
+             joinedAt: admin.firestore.FieldValue.serverTimestamp()
+           })
+         });
+@@ -118,6 +119,7 @@ app.prepare().then(() => {
+             socketId: socket.id,
+             isLeader: true, // Host is the default leader
+             isHost: true,
++            isReady: false,
+             joinedAt: admin.firestore.FieldValue.serverTimestamp()
+           }]
+         });
+@@ -134,6 +136,44 @@ app.prepare().then(() => {
+       }
+     });
+ 
++    // Toggle player ready status
++    socket.on('toggleReady', async ({ roomCode, playerId }) => {
++      try {
++        const roomRef = db.collection('rooms').doc(roomCode);
++        const roomDoc = await roomRef.get();
++        
++        if (!roomDoc.exists) {
++          socket.emit('roomError', 'Room does not exist');
++          return;
++        }
++        
++        const roomData = roomDoc.data();
++        const playerIndex = roomData.players.findIndex(player => player.id === playerId);
++        
++        if (playerIndex === -1) {
++          socket.emit('roomError', 'Player not found in room');
++          return;
++        }
++        
++        // Toggle the ready status
++        const updatedPlayers = [...roomData.players];
++        updatedPlayers[playerIndex] = {
++          ...updatedPlayers[playerIndex],
++          isReady: !updatedPlayers[playerIndex].isReady
++        };
++        
++        await roomRef.update({ players: updatedPlayers });
++        
++        // Send updated room state to all players
++        const updatedRoom = await roomRef.get();
++        io.to(roomCode).emit('roomState', updatedRoom.data());
++        
++      } catch (error) {
++        console.error('Error toggling ready status:', error);
++        socket.emit('roomError', 'Failed to update ready status');
++      }
++    });
++
+     // Set leader
+     socket.on('setLeader', async ({ roomCode, playerId }) => {
+       try {
+diff --git a/src/app/lobby/page.tsx b/src/app/lobby/page.tsx
+index 0310996..f05baea 100644
+--- a/src/app/lobby/page.tsx
++++ b/src/app/lobby/page.tsx
+@@ -12,10 +12,25 @@ interface Player {
+   socketId: string;
+   isLeader: boolean;
+   isHost?: boolean;
++  isReady?: boolean;
+   joinedAt: any; // Firebase timestamp
+   votes?: number;
+ }
+ 
++// Add interface for createRoomData
++interface CreateRoomData {
++  roomName: string;
++  hostName: string;
++  hostId: string;
++  customCode?: string;
++}
++
++// Add interface for joinRoomData
++interface JoinRoomData {
++  roomCode: string;
++  playerName: string;
++}
++
+ export default function Lobby() {
+   const router = useRouter();
+   const { 
+@@ -27,6 +42,7 @@ export default function Lobby() {
+     createRoom, 
+     joinRoom,
+     setNewLeader,
++    toggleReady,
+     amILeader 
+   } = useSocket();
+   
+@@ -42,70 +58,151 @@ export default function Lobby() {
+   const [votingActive, setVotingActive] = useState(false);
+   const [votedForId, setVotedForId] = useState<string | null>(null);
+   const [startingGame, setStartingGame] = useState(false);
++  const [showCopiedMessage, setShowCopiedMessage] = useState(false);
+   
+-  // Generate a unique player ID when the component mounts
++  // Generate a player ID on initial render if not already in localStorage
+   useEffect(() => {
+-    setPlayerId(uuidv4());
++    let storedId = '';
+     
+-    // Check if coming from the setup page with create room data
+-    const createRoomData = localStorage.getItem('createRoomData');
+-    if (createRoomData) {
+-      try {
+-        const data = JSON.parse(createRoomData);
+-        setRoomName(data.roomName);
+-        setPlayerName(data.hostName);
+-        setPlayerId(data.hostId);
+-        
+-        // Clear the data to avoid duplicate creation
+-        localStorage.removeItem('createRoomData');
+-        
+-        // If we have a custom code, use it
+-        if (data.customCode) {
+-          handleCreateWithCustomCode(data.roomName, data.hostName, data.hostId, data.customCode);
+-        } else {
+-          // Create with random code
+-          handleCreateWithRandomCode(data.roomName, data.hostName, data.hostId);
+-        }
+-      } catch (error) {
+-        console.error('Failed to parse create room data:', error);
++    try {
++      const playerInfo = localStorage.getItem('playerInfo');
++      if (playerInfo) {
++        const parsed = JSON.parse(playerInfo);
++        storedId = parsed.id;
++        setPlayerId(storedId);
++        setPlayerName(parsed.name || '');
+       }
++    } catch (error) {
++      console.error('Failed to parse player info:', error);
+     }
+     
+-    // Check if coming from the home page with join room code
+-    const joinRoomCode = localStorage.getItem('joinRoomCode');
+-    if (joinRoomCode) {
+-      setRoomCode(joinRoomCode);
+-      setIsJoiningRoom(true);
+-      
+-      // Clear the data to avoid duplicate joining
+-      localStorage.removeItem('joinRoomCode');
++    if (!storedId) {
++      const newId = uuidv4();
++      setPlayerId(newId);
++      localStorage.setItem('playerInfo', JSON.stringify({ id: newId }));
+     }
+   }, []);
+ 
+-  // Show the skip button after a delay
++  // Check for createRoomData from setup page and join automatically
+   useEffect(() => {
+-    const timer = setTimeout(() => {
+-      setShowSkipButton(true);
+-    }, 5000);
++    if (isConnected && !hasJoinedRoom && !currentRoom) {
++      try {
++        const createRoomDataString = localStorage.getItem('createRoomData');
++        if (createRoomDataString) {
++          const createRoomData: CreateRoomData = JSON.parse(createRoomDataString);
++          
++          // Update local state with values from createRoomData
++          setRoomName(createRoomData.roomName);
++          setPlayerName(createRoomData.hostName);
++          setPlayerId(createRoomData.hostId);
++          
++          // Store player name in playerInfo
++          localStorage.setItem('playerInfo', JSON.stringify({ 
++            id: createRoomData.hostId,
++            name: createRoomData.hostName 
++          }));
++          
++          // Create room using stored data
++          if (createRoomData.customCode) {
++            handleCreateWithCustomCode(
++              createRoomData.roomName,
++              createRoomData.hostName,
++              createRoomData.hostId,
++              createRoomData.customCode
++            );
++          } else {
++            handleCreateWithRandomCode(
++              createRoomData.roomName,
++              createRoomData.hostName,
++              createRoomData.hostId
++            );
++          }
++          
++          // Clear the create room data after using it
++          localStorage.removeItem('createRoomData');
++        } else {
++          // Check for joinRoomData if no createRoomData exists
++          const joinRoomDataString = localStorage.getItem('joinRoomData');
++          if (joinRoomDataString) {
++            const joinRoomData: JoinRoomData = JSON.parse(joinRoomDataString);
++            
++            // Update local state
++            setPlayerName(joinRoomData.playerName);
++            setRoomCode(joinRoomData.roomCode);
++            
++            // Store player name in playerInfo
++            if (playerId) {
++              localStorage.setItem('playerInfo', JSON.stringify({ 
++                id: playerId,
++                name: joinRoomData.playerName 
++              }));
++              
++              // Join the room
++              if (typeof joinRoom === 'function') {
++                joinRoom(joinRoomData.roomCode, joinRoomData.playerName, playerId);
++                setHasJoinedRoom(true);
++              }
++            }
++            
++            // Clear the join room data after using it
++            localStorage.removeItem('joinRoomData');
++          }
++        }
++      } catch (error) {
++        console.error('Failed to process room data:', error);
++      }
++    }
++  }, [isConnected, currentRoom, hasJoinedRoom, playerId]);
++  
++  // Store player name when it changes
++  useEffect(() => {
++    if (playerName && playerId) {
++      try {
++        const existingInfo = localStorage.getItem('playerInfo');
++        const infoObj = existingInfo ? JSON.parse(existingInfo) : { id: playerId };
++        infoObj.name = playerName;
++        localStorage.setItem('playerInfo', JSON.stringify(infoObj));
++      } catch (error) {
++        console.error('Failed to update player info:', error);
++      }
++    }
++  }, [playerName, playerId]);
++  
++  // Handle game start
++  const handleStartGame = () => {
++    if (!currentRoom) return;
+     
+-    return () => clearTimeout(timer);
+-  }, []);
++    setStartingGame(true);
++    
++    // Store mission start time and team info in localStorage
++    localStorage.setItem('escapeRoomTeam', JSON.stringify({
++      team: { name: roomName || `Room ${currentRoom}`, agents: players ? players.length : 0 },
++      gameCode: currentRoom,
++      startTime: new Date().toISOString(),
++      connectedAgents: players ? players.length : 0
++    }));
++    
++    // Navigate to game
++    setTimeout(() => {
++      router.push('/game');
++    }, 1000);
++  };
+ 
+   // Navigate to game when the countdown is complete
+   useEffect(() => {
+     if (currentRoom && hasJoinedRoom) {
+       // Store the room data in localStorage for persistence
+       localStorage.setItem('escapeRoomTeam', JSON.stringify({
+-        team: { name: roomName || `Room ${currentRoom}`, agents: players?.length || 0 },
++        team: { name: roomName || `Room ${currentRoom}`, agents: players ? players.length : 0 },
+         gameCode: currentRoom,
+         startTime: new Date().toISOString(),
+-        connectedAgents: players?.length || 0
++        connectedAgents: players ? players.length : 0
+       }));
+     }
+   }, [currentRoom, hasJoinedRoom, roomName, players]);
+ 
+   const handleCreateWithRandomCode = (roomName: string, hostName: string, hostId: string) => {
+-    if (createRoom) {
++    if (typeof createRoom === 'function') {
+       createRoom(roomName, hostName, hostId);
+       setIsCreatingRoom(false);
+       setHasJoinedRoom(true);
+@@ -113,7 +210,7 @@ export default function Lobby() {
+   };
+ 
+   const handleCreateWithCustomCode = (roomName: string, hostName: string, hostId: string, customCode: string) => {
+-    if (createRoom) {
++    if (typeof createRoom === 'function') {
+       // The server should handle creating with a custom code
+       // For now, we'll just use the createRoom function
+       createRoom(roomName, hostName, hostId, customCode);
+@@ -133,7 +230,7 @@ export default function Lobby() {
+     e.preventDefault();
+     if (!playerName.trim() || !roomCode.trim()) return;
+ 
+-    if (joinRoom) {
++    if (typeof joinRoom === 'function') {
+       joinRoom(roomCode.toUpperCase(), playerName, playerId);
+       setIsJoiningRoom(false);
+       setHasJoinedRoom(true);
+@@ -147,72 +244,50 @@ export default function Lobby() {
+     // For now, we'll just update the local state
+     setVotedForId(id);
+   };
+-
+-  const handleSetLeader = (id: string) => {
+-    if (setNewLeader) {
+-      setNewLeader(id);
+-      // Once leader is set, close voting
+-      setVotingActive(false);
+-    }
+-  };
+-
++  
+   const handleStartVoting = () => {
+     setVotingActive(true);
+   };
+-
+-  const handleStartGame = () => {
+-    setStartingGame(true);
+-    // Start with video intro
+-    setIsVideoPlaying(true);
++  
++  const handleEndVoting = () => {
++    // In a real implementation, this would tally votes and send to server
++    // For now, just end the voting period
++    setVotingActive(false);
++    setVotedForId(null);
+   };
+-
+-  const handleSkipVideo = () => {
+-    setIsVideoPlaying(false);
+-    // After skipping video, go to the game
+-    router.push('/game');
++  
++  const handleToggleReady = () => {
++    if (typeof toggleReady === 'function' && playerId) {
++      toggleReady(playerId);
++    }
+   };
+-
+-  const handleVideoEnded = () => {
+-    setIsVideoPlaying(false);
+-    // After video ends, go to the game
+-    router.push('/game');
++  
++  const handleCopyRoomCode = () => {
++    if (currentRoom) {
++      navigator.clipboard.writeText(currentRoom)
++        .then(() => {
++          setShowCopiedMessage(true);
++          setTimeout(() => setShowCopiedMessage(false), 2000);
++        })
++        .catch(err => {
++          console.error('Failed to copy room code:', err);
++        });
++    }
++  };
++  
++  // Check if all players are ready
++  const areAllPlayersReady = () => {
++    if (!players || !Array.isArray(players) || players.length === 0) return false;
++    return players.every((player: Player) => player.isReady === true);
+   };
+-
+-  // Display loading screen if connecting to socket
+-  if (!isConnected) {
+-    return (
+-      <div className="min-h-screen flex items-center justify-center bg-black">
+-        <div className="text-white text-xl">Connecting to server...</div>
+-      </div>
+-    );
+-  }
+-
+-  // Display intro video when starting the game
+-  if (isVideoPlaying) {
+-    return (
+-      <div className="relative min-h-screen overflow-hidden bg-black">
+-        <video 
+-          className="absolute top-0 left-0 w-full h-full object-cover"
+-          src="/Hacker Computer  Mask Criminal.mp4"
+-          autoPlay
+-          muted
+-          onEnded={handleVideoEnded}
+-        />
+-        
+-        {showSkipButton && (
+-          <button
+-            onClick={handleSkipVideo}
+-            className="absolute bottom-8 right-8 px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded"
+-          >
+-            Skip Intro
+-          </button>
+-        )}
+-      </div>
+-    );
+-  }
+ 
+   // If already joined a room, show the waiting room
+   if (hasJoinedRoom && currentRoom) {
++    // Get current player details
++    const currentPlayer = players && Array.isArray(players) 
++      ? players.find((p: Player) => p.id === playerId) 
++      : undefined;
++    
+     return (
+       <div className="min-h-screen bg-gray-900 text-white flex flex-col">
+         <div className="bg-black p-4">
+@@ -225,15 +300,26 @@ export default function Lobby() {
+           <div className="bg-black/50 p-6 rounded-lg border border-blue-900/50 mb-8">
+             <h2 className="text-xl font-bold mb-4">Room: {roomName || `Room ${currentRoom}`}</h2>
+             <div className="bg-gray-800/50 p-4 rounded mb-4">
+-              <p className="font-mono">Room Code: <span className="text-yellow-400">{currentRoom}</span></p>
++              <div className="flex items-center justify-between">
++                <p className="font-mono">Room Code: <span className="text-yellow-400">{currentRoom}</span></p>
++                <button 
++                  onClick={handleCopyRoomCode} 
++                  className="px-3 py-1 bg-blue-900/70 hover:bg-blue-800 rounded-md text-sm ml-4"
++                >
++                  Copy Code
++                </button>
++              </div>
++              {showCopiedMessage && (
++                <p className="text-green-400 text-xs mt-1">Copied to clipboard!</p>
++              )}
+               <p className="text-sm text-gray-400 mt-2">Share this code with your team members</p>
+             </div>
+             
+-            <div className="mb-6">
++            
+               <div className="flex justify-between items-center mb-2">
+-                <h3 className="text-lg font-bold">Connected Agents ({players?.length || 0})</h3>
++                <h3 className="text-lg font-bold">Connected Agents ({players && Array.isArray(players) ? players.length : 0})</h3>
+                 
+-                {!votingActive && !leader && players && players.length > 1 && (
++                {!votingActive && !leader && players && Array.isArray(players) && players.length > 1 && (
+                   <button
+                     onClick={handleStartVoting}
+                     className="px-3 py-1 bg-blue-700 hover:bg-blue-600 rounded-md text-sm"
+@@ -244,64 +330,106 @@ export default function Lobby() {
+               </div>
+               
+               <div className="space-y-2">
+-                {players && players.map((player: Player) => (
++                {players && Array.isArray(players) && players.map((player: Player) => (
+                   <div key={player.id} className="flex items-center justify-between bg-gray-800 p-2 rounded">
+                     <div className="flex items-center">
+                       <div className={`w-3 h-3 rounded-full mr-2 ${player.isLeader ? 'bg-green-500' : 'bg-gray-500'}`}></div>
+                       <span>{player.name}</span>
+                       {player.isLeader && <span className="ml-2 text-xs bg-green-900/50 px-2 py-0.5 rounded text-green-400">LEADER</span>}
+                       {player.isHost && <span className="ml-2 text-xs bg-blue-900/50 px-2 py-0.5 rounded text-blue-400">HOST</span>}
++                      {player.isReady && <span className="ml-2 text-xs bg-yellow-900/50 px-2 py-0.5 rounded text-yellow-400">READY</span>}
+                       {votingActive && votedForId === player.id && (
+-                        <span className="ml-2 text-xs bg-yellow-900/50 px-2 py-0.5 rounded text-yellow-400">VOTED</span>
++                        <span className="ml-2 text-xs bg-purple-900/50 px-2 py-0.5 rounded text-purple-400">VOTED</span>
+                       )}
+                     </div>
+                     
+-                    <div>
+-                      {votingActive && player.id !== playerId && (
++                    <div className="flex gap-2 items-center">
++                      {/* Ready status indicator */}
++                      <div className={`h-5 w-5 flex items-center justify-center rounded-full border ${
++                        player.isReady 
++                          ? 'border-green-500 bg-green-900/30' 
++                          : 'border-red-500 bg-red-900/30'
++                        }`}
++                      >
++                        {player.isReady 
++                          ? <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-green-500" viewBox="0 0 20 20" fill="currentColor">
++                              <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
++                            </svg>
++                          : <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-red-500" viewBox="0 0 20 20" fill="currentColor">
++                              <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
++                            </svg>
++                        }
++                      </div>
++
++                      {/* Ready toggle button for current player */}
++                      {player.id === playerId && (
+                         <button
+-                          onClick={() => handleVoteForLeader(player.id)}
+-                          className={`text-xs px-2 py-1 ${
+-                            votedForId === player.id 
+-                              ? 'bg-green-900/50 text-green-400' 
+-                              : 'bg-blue-900/50 hover:bg-blue-800 text-white'
+-                          } rounded mr-2`}
++                          onClick={handleToggleReady}
++                          className={`px-3 py-1 rounded-md text-xs ${
++                            player.isReady 
++                              ? 'bg-red-700 hover:bg-red-600 text-white' 
++                              : 'bg-green-700 hover:bg-green-600 text-white'
++                          }`}
+                         >
+-                          {votedForId === player.id ? 'Voted' : 'Vote for Leader'}
++                          {player.isReady ? 'Not Ready' : 'Ready'}
+                         </button>
+                       )}
+                       
+-                      {!votingActive && !player.isLeader && amILeader && playerId && amILeader(playerId) && (
++                      {/* Leader vote button */}
++                      {votingActive && player.id !== playerId && (
+                         <button
+-                          onClick={() => handleSetLeader(player.id)}
+-                          className="text-xs px-2 py-1 bg-blue-900/50 hover:bg-blue-800 rounded"
++                          onClick={() => handleVoteForLeader(player.id)}
++                          className={`px-3 py-1 ${
++                            votedForId === player.id 
++                              ? 'bg-purple-700' 
++                              : 'bg-blue-900 hover:bg-blue-800'
++                          } rounded-md text-xs`}
+                         >
+-                          Make Leader
++                          {votedForId === player.id ? 'Voted' : 'Vote Leader'}
+                         </button>
+                       )}
+                     </div>
+                   </div>
+                 ))}
+-              </div>
+-            </div>
+-            
+-            {votingActive && (
+-              <div className="p-4 bg-yellow-900/20 border border-yellow-900/50 rounded-md mb-6">
+-                <h4 className="font-bold text-yellow-400 mb-2">Leader Voting</h4>
+-                <p className="text-sm text-gray-300">
+-                  Cast your vote for who should be the team leader. The leader will control inputs during the mission.
+-                </p>
+-                {votedForId && (
+-                  <div className="mt-3 flex justify-end">
++                
++                {votingActive && (
++                  <div className="mt-4">
+                     <button
+-                      onClick={() => setVotedForId(null)}
+-                      className="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded"
++                      onClick={handleEndVoting}
++                      className="px-4 py-2 bg-red-700 hover:bg-red-600 rounded-md text-sm"
+                     >
+-                      Change Vote
++                      End Voting
+                     </button>
+                   </div>
+                 )}
+               </div>
+-            )}
++            
++              {/* Ready status progress indicator */}
++              {players && Array.isArray(players) && players.length > 0 && (
++                <div className="mt-4 p-3 bg-gray-800/70 rounded-md">
++                  <div className="flex justify-between items-center mb-2">
++                    <span className="text-sm">Ready Status:</span>
++                    <span className="text-sm">
++                      {players.filter(p => p.isReady).length} / {players.length} agents ready
++                    </span>
++                  </div>
++                  <div className="w-full bg-gray-700 h-2 rounded-full overflow-hidden">
++                    <div 
++                      className="bg-green-600 h-full rounded-full transition-all duration-500 ease-in-out"
++                      style={{ 
++                        width: `${players.filter(p => p.isReady).length / players.length * 100}%`,
++                      }}
++                    ></div>
++                  </div>
++                  {players.every(p => p.isReady) ? (
++                    <p className="text-green-400 text-xs mt-2 text-center">All agents ready!</p>
++                  ) : (
++                    <p className="text-yellow-400 text-xs mt-2 text-center">
++                      Waiting for {players.length - players.filter(p => p.isReady).length} more agent(s) to be ready
++                    </p>
++                  )}
++                </div>
++              )}
+             
+             <div className="mt-6">
+               <p className="mb-4 text-gray-300">
+@@ -311,26 +439,42 @@ export default function Lobby() {
+                 }
+               </p>
+               
+-              {leader && amILeader && playerId && amILeader(playerId) && (
++              {leader && typeof amILeader === 'function' && playerId && amILeader(playerId) && (
+                 <button
+                   onClick={handleStartGame}
+-                  disabled={startingGame}
++                  disabled={startingGame || !areAllPlayersReady()}
+                   className={`w-full py-3 rounded-md font-bold ${
+-                    startingGame ? 'bg-gray-700 cursor-not-allowed' : 'bg-blue-700 hover:bg-blue-600'
++                    startingGame 
++                      ? 'bg-gray-700 cursor-not-allowed' 
++                      : !areAllPlayersReady()
++                        ? 'bg-gray-700 cursor-not-allowed'
++                        : 'bg-blue-700 hover:bg-blue-600 animate-pulse shadow-[0_0_15px_rgba(37,99,235,0.5)]'
+                   }`}
+                 >
+-                  {startingGame ? 'Starting Mission...' : 'Start Mission'}
++                  {startingGame 
++                    ? 'Starting Mission...' 
++                    : !areAllPlayersReady()
++                      ? 'Waiting for all agents to be ready...'
++                      : 'Start Mission'
++                  }
+                 </button>
+               )}
+               
+-              {(!leader || !amILeader || !playerId || !amILeader(playerId)) && (
++              {(!leader || typeof amILeader !== 'function' || !playerId || !amILeader(playerId)) && (
+                 <div className="p-3 bg-gray-800/80 rounded-md text-center">
+                   {leader 
+-                    ? "Waiting for the leader to start the mission..."
++                    ? areAllPlayersReady()
++                      ? "All agents ready! Waiting for the leader to start the mission..."
++                      : "Waiting for the leader to start the mission..."
+                     : "Waiting for a team leader to be selected..."
+                   }
+                 </div>
+               )}
++              
++              <div className="mt-3 text-center text-xs text-gray-500">
++                <p>All agents must be ready before the mission can start.</p>
++                <p className="mt-1">The leader will have control of mission inputs while other agents provide support.</p>
++              </div>
+             </div>
+           </div>
+         </div>
+@@ -356,7 +500,8 @@ export default function Lobby() {
+               Work together as a team to infiltrate the compromised system. One agent will lead the operation while others provide support.
+             </p>
+             
+-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
++            {!isCreatingRoom && !isJoiningRoom && (
++              <div className="space-y-4">
+               <div
+                 className={`p-4 border rounded-md ${isCreatingRoom ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 hover:border-blue-700 bg-gray-800/30 hover:bg-gray-800/50'} cursor-pointer transition-colors`}
+                 onClick={() => {
+@@ -379,6 +524,7 @@ export default function Lobby() {
+                 <p className="text-sm text-gray-400">Enter a room code to join an existing mission.</p>
+               </div>
+             </div>
++            )}
+             
+             {isCreatingRoom && (
+               <div className="mt-6 p-4 bg-gray-800/50 rounded-md">
+@@ -461,17 +607,6 @@ export default function Lobby() {
+               </div>
+             )}
+             
+-            {error && (
+-              <div className="mt-4 p-3 bg-red-900/30 border border-red-800 rounded-md text-red-300 text-sm">
+-                {error}
+-              </div>
+-            )}
+-          </div>
+-          
+-          <div className="text-center">
+-            <Link href="/" className="text-blue-400 hover:text-blue-300">
+-              ← Back to Home
+-            </Link>
+           </div>
+         </div>
+       </div>
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index ef14075..6b0415d 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -17,9 +17,10 @@ interface BackgroundLine {
+ 
+ export default function Home() {
+   const router = useRouter();
+-  const [showOptions, setShowOptions] = useState(false);
+   const [joinCode, setJoinCode] = useState('');
++  const [playerName, setPlayerName] = useState('');
+   const [joinError, setJoinError] = useState('');
++  const [showJoinForm, setShowJoinForm] = useState(false);
+   const [backgroundLines, setBackgroundLines] = useState<BackgroundLine[]>([]);
+   const containerRef = useRef(null);
+ 
+@@ -44,14 +45,6 @@ export default function Home() {
+     generateBackgroundLines();
+   }, []);
+ 
+-  const handleStart = () => {
+-    setShowOptions(true);
+-  };
+-
+-  const handleCreateRoom = () => {
+-    router.push('/setup');
+-  };
+-
+   const handleJoinRoom = (e: React.FormEvent) => {
+     e.preventDefault();
+     
+@@ -60,8 +53,17 @@ export default function Home() {
+       return;
+     }
+     
+-    // Store the room code and navigate to the lobby
+-    localStorage.setItem('joinRoomCode', joinCode.toUpperCase());
++    if (!playerName.trim()) {
++      setJoinError('Please enter your name');
++      return;
++    }
++    
++    // Store the room code and player name, then navigate to the lobby
++    localStorage.setItem('joinRoomData', JSON.stringify({
++      roomCode: joinCode.toUpperCase(),
++      playerName: playerName
++    }));
++    
+     router.push('/lobby');
+   };
+ 
+@@ -86,160 +88,155 @@ export default function Home() {
+       </div>
+ 
+       <div className="z-10 max-w-5xl w-full mx-auto px-4">
+-        {!showOptions ? (
+-          <div className="flex flex-col items-center">
+-            {/* Top Status Bar */}
+-            <div className="w-full bg-gray-900/70 backdrop-blur-sm border-b border-blue-900/50 py-2 px-4 mb-8 flex justify-between items-center fixed top-0 left-0 z-20">
+-              <div className="text-sm font-mono text-blue-400">SYSTEM STATUS: <span className="text-red-500">COMPROMISED</span></div>
+-              <div className="text-sm font-mono text-blue-400">TIME: 03:14:07</div>
+-            </div>
++        <div className="flex flex-col items-center">
++          {/* Top Status Bar */}
++          <div className="w-full bg-gray-900/70 backdrop-blur-sm border-b border-blue-900/50 py-2 px-4 mb-8 flex justify-between items-center fixed top-0 left-0 z-20">
++            <div className="text-sm font-mono text-blue-400">SYSTEM STATUS: <span className="text-red-500">COMPROMISED</span></div>
++            <div className="text-sm font-mono text-blue-400">TIME: 03:14:07</div>
++          </div>
+ 
+-            {/* Main Content */}
+-            <div className="mt-20 w-full">
+-              {/* Header Section with title */}
+-              <div className="text-center mb-16 relative">
+-                <h1 className="text-5xl md:text-7xl font-bold text-blue-600 mb-3 animate-pulse tracking-wider">
+-                  <span className="glitch-title">SYSTEM BREACH</span>
+-                </h1>
+-                <div className="text-xl md:text-2xl font-bold text-blue-400 tracking-widest font-mono mb-8">
+-                  TOMAX SECURITY DIVISION
+-                </div>
+-                <div className="h-1 w-48 bg-blue-700 mx-auto rounded-full mb-8 shadow-[0_0_15px_rgba(37,99,235,0.8)]"></div>
+-                <p className="text-xl max-w-2xl mx-auto leading-relaxed text-gray-300">
+-                  A high-stakes cyber security challenge where agents race against time to stop a devastating hack
+-                </p>
++          {/* Main Content */}
++          <div className="mt-20 w-full">
++            {/* Header Section with title */}
++            <div className="text-center mb-16 relative">
++              <h1 className="text-5xl md:text-7xl font-bold text-blue-600 mb-3 animate-pulse tracking-wider">
++                <span className="glitch-title">SYSTEM BREACH</span>
++              </h1>
++              <div className="text-xl md:text-2xl font-bold text-blue-400 tracking-widest font-mono mb-8">
++                TOMAX SECURITY DIVISION
+               </div>
+-              
+-              {/* Main Image with Overlay */}
+-              <div className="w-full max-w-4xl mx-auto mb-16 relative rounded-lg overflow-hidden shadow-[0_0_30px_rgba(37,99,235,0.3)] border border-blue-900/30">
+-                <div className="relative aspect-video">
+-                  <Image
+-                    src="/image-homepage.jpg"
+-                    alt="Cyber Security Breach"
+-                    fill
+-                    className="object-cover"
+-                    priority
+-                  />
+-                  <div className="absolute inset-0 bg-gradient-to-t from-black via-black/50 to-transparent"></div>
+-                  
+-                  {/* Overlay Elements */}
+-                  <div className="absolute bottom-0 left-0 w-full p-6 bg-gradient-to-t from-black to-transparent">
+-                    <div className="font-mono text-red-500 text-lg mb-2 animate-pulse">// CRITICAL SECURITY ALERT</div>
+-                    <div className="text-white text-xl md:text-2xl mb-4">System compromised at 03:14 AM</div>
+-                  </div>
+-                  
+-                  {/* Scan lines effect */}
+-                  <div className="absolute inset-0 bg-scanlines opacity-10 pointer-events-none"></div>
++              <div className="h-1 w-48 bg-blue-700 mx-auto rounded-full mb-8 shadow-[0_0_15px_rgba(37,99,235,0.8)]"></div>
++              <p className="text-xl max-w-2xl mx-auto leading-relaxed text-gray-300">
++                A high-stakes cyber security challenge where agents race against time to stop a devastating hack
++              </p>
++            </div>
++            
++            {/* Main Image with Overlay */}
++            <div className="w-full max-w-4xl mx-auto mb-16 relative rounded-lg overflow-hidden shadow-[0_0_30px_rgba(37,99,235,0.3)] border border-blue-900/30">
++              <div className="relative aspect-video">
++                <Image
++                  src="/image-homepage.jpg"
++                  alt="Cyber Security Breach"
++                  fill
++                  className="object-cover"
++                  priority
++                />
++                <div className="absolute inset-0 bg-gradient-to-t from-black via-black/50 to-transparent"></div>
++                
++                {/* Overlay Elements */}
++                <div className="absolute bottom-0 left-0 w-full p-6 bg-gradient-to-t from-black to-transparent">
++                  <div className="font-mono text-red-500 text-lg mb-2 animate-pulse">// CRITICAL SECURITY ALERT</div>
++                  <div className="text-white text-xl md:text-2xl mb-4">System compromised at 03:14 AM</div>
+                 </div>
++                
++                {/* Scan lines effect */}
++                <div className="absolute inset-0 bg-scanlines opacity-10 pointer-events-none"></div>
+               </div>
+-              
+-              {/* Mission Brief */}
+-              <div className="bg-gray-900/40 backdrop-blur-sm border border-blue-900/30 rounded-lg p-6 max-w-3xl mx-auto mb-12">
+-                <h2 className="text-2xl font-bold text-blue-400 mb-4">MISSION BRIEF</h2>
+-                <p className="mb-4 text-lg">
+-                  A critical security breach has been detected at TOMAX systems. Create a secure lobby and invite your agents to stop the countdown before all data is permanently encrypted.
+-                </p>
+-                <div className="flex flex-wrap gap-4 text-sm text-gray-400 mt-6 justify-center">
+-                  <div className="flex items-center">
+-                    <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
+-                    <span>Create a mission lobby</span>
+-                  </div>
+-                  <div className="flex items-center">
+-                    <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
+-                    <span>Share the code with agents</span>
+-                  </div>
+-                  <div className="flex items-center">
+-                    <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
+-                    <span>Work together to solve the breach</span>
+-                  </div>
++            </div>
++            
++            {/* Mission Brief */}
++            <div className="bg-gray-900/40 backdrop-blur-sm border border-blue-900/30 rounded-lg p-6 max-w-3xl mx-auto mb-12">
++              <h2 className="text-2xl font-bold text-blue-400 mb-4">MISSION BRIEF</h2>
++              <p className="mb-4 text-lg">
++                A critical security breach has been detected at TOMAX systems. Create a secure lobby and invite your agents to stop the countdown before all data is permanently encrypted.
++              </p>
++              <div className="flex flex-wrap gap-4 text-sm text-gray-400 mt-6 justify-center">
++                <div className="flex items-center">
++                  <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
++                  <span>Create a mission lobby</span>
++                </div>
++                <div className="flex items-center">
++                  <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
++                  <span>Share the code with agents</span>
++                </div>
++                <div className="flex items-center">
++                  <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
++                  <span>Work together to solve the breach</span>
+                 </div>
+               </div>
+-              
+-              {/* Call to Action Buttons */}
++            </div>
++            
++            {/* Simplified Action Buttons */}
++            {!showJoinForm ? (
+               <div className="flex flex-col md:flex-row justify-center gap-6 mb-16">
+                 <Link 
+                   href="/setup" 
+                   className="flex items-center justify-center px-8 py-4 text-xl bg-blue-700 hover:bg-blue-600 text-white font-bold rounded-md transition-all relative overflow-hidden group"
+                 >
+-                  <span className="relative z-10">CREATE LOBBY</span>
++                  <span className="relative z-10">CREATE ROOM</span>
+                   <span className="absolute inset-0 bg-gradient-to-r from-blue-600 to-blue-800 transform scale-x-0 group-hover:scale-x-100 transition-transform origin-left"></span>
+                 </Link>
+                 <button 
+-                  onClick={handleStart}
++                  onClick={() => setShowJoinForm(true)}
+                   className="flex items-center justify-center px-8 py-4 text-xl bg-gray-800 hover:bg-gray-700 text-white font-bold rounded-md transition-all relative overflow-hidden group"
+                 >
+-                  <span className="relative z-10">JOIN MISSION</span>
++                  <span className="relative z-10">JOIN ROOM</span>
+                   <span className="absolute inset-0 bg-gradient-to-r from-gray-700 to-gray-900 transform scale-x-0 group-hover:scale-x-100 transition-transform origin-left"></span>
+                 </button>
+               </div>
+-              
+-              {/* Footer with terminal style */}
+-              <div className="text-center text-sm text-gray-500 bg-black/50 py-4 px-6 rounded-t-lg mx-auto max-w-md font-mono">
+-                <div className="animate-blink">█</div>
+-                <div>system_breach.exe v1.0.3 • TOMAX SECURITY PROTOCOL</div>
+-              </div>
+-            </div>
+-          </div>
+-        ) : (
+-          <div className="w-full max-w-md bg-gray-900/80 backdrop-blur-sm rounded-lg p-6 border border-blue-900/50">
+-            <h2 className="text-xl font-bold mb-6 text-center text-blue-400">Choose Your Option</h2>
+-            
+-            <div className="space-y-6">
+-              <button
+-                onClick={handleCreateRoom}
+-                className="w-full py-4 bg-blue-700 hover:bg-blue-600 rounded-md font-bold text-lg"
+-              >
+-                Create New Room
+-              </button>
+-              
+-              <div className="relative">
+-                <div className="absolute inset-0 flex items-center">
+-                  <div className="w-full border-t border-gray-700"></div>
+-                </div>
+-                <div className="relative flex justify-center">
+-                  <span className="bg-gray-900 px-3 text-gray-500 text-sm">OR</span>
+-                </div>
+-              </div>
+-              
+-              <form onSubmit={handleJoinRoom} className="space-y-4">
+-                <div>
+-                  <label className="block text-sm font-medium mb-1" htmlFor="gameCode">
+-                    Enter Room Code
+-                  </label>
+-                  <input
+-                    id="gameCode"
+-                    type="text"
+-                    value={joinCode}
+-                    onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+-                    placeholder="e.g. ABC123"
+-                    className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600 uppercase"
+-                    maxLength={6}
+-                  />
++            ) : (
++              <div className="max-w-md mx-auto bg-gray-900/80 backdrop-blur-sm rounded-lg p-6 border border-blue-900/50 mb-16">
++                <h3 className="text-xl font-bold mb-4 text-center text-blue-400">Join a Room</h3>
++                <form onSubmit={handleJoinRoom} className="space-y-4">
++                  <div>
++                    <label className="block text-sm font-medium mb-1" htmlFor="playerName">
++                      Your Name
++                    </label>
++                    <input
++                      id="playerName"
++                      type="text"
++                      value={playerName}
++                      onChange={(e) => setPlayerName(e.target.value)}
++                      placeholder="Enter your name"
++                      className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
++                    />
++                  </div>
+                   
+-                  {joinError && (
+-                    <p className="mt-1 text-red-400 text-xs">{joinError}</p>
+-                  )}
+-                </div>
+-                
+-                <button
+-                  type="submit"
+-                  className="w-full py-3 bg-gray-700 hover:bg-gray-600 rounded-md font-medium"
+-                >
+-                  Join Existing Room
+-                </button>
+-              </form>
+-            </div>
++                  <div>
++                    <label className="block text-sm font-medium mb-1" htmlFor="gameCode">
++                      Room Code
++                    </label>
++                    <input
++                      id="gameCode"
++                      type="text"
++                      value={joinCode}
++                      onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
++                      placeholder="e.g. ABC123"
++                      className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600 uppercase"
++                      maxLength={6}
++                    />
++                    
++                    {joinError && (
++                      <p className="mt-1 text-red-400 text-xs">{joinError}</p>
++                    )}
++                  </div>
++                  
++                  <div className="flex gap-3">
++                    <button
++                      type="submit"
++                      className="flex-1 py-3 bg-blue-700 hover:bg-blue-600 rounded-md font-medium"
++                    >
++                      Join Room
++                    </button>
++                    <button
++                      type="button"
++                      onClick={() => setShowJoinForm(false)}
++                      className="py-3 px-4 bg-gray-700 hover:bg-gray-600 rounded-md"
++                    >
++                      Back
++                    </button>
++                  </div>
++                </form>
++              </div>
++            )}
+             
+-            <div className="mt-6 text-center">
+-              <button
+-                onClick={() => setShowOptions(false)}
+-                className="text-gray-400 text-sm hover:text-blue-400"
+-              >
+-                ← Back
+-              </button>
++            {/* Footer with terminal style */}
++            <div className="text-center text-sm text-gray-500 bg-black/50 py-4 px-6 rounded-t-lg mx-auto max-w-md font-mono">
++              <div className="animate-blink">█</div>
++              <div>system_breach.exe v1.0.3 • TOMAX SECURITY PROTOCOL</div>
+             </div>
+           </div>
+-        )}
++        </div>
+       </div>
+ 
+       {/* Add custom styles for animations */}
+diff --git a/src/context/SocketContext.js b/src/context/SocketContext.js
+index e9f8150..4099b65 100644
+--- a/src/context/SocketContext.js
++++ b/src/context/SocketContext.js
+@@ -3,6 +3,38 @@
+ import { createContext, useContext, useEffect, useState } from 'react';
+ import { io } from 'socket.io-client';
+ 
++/**
++ * @typedef {Object} Player
++ * @property {string} id - Player unique identifier
++ * @property {string} name - Player name
++ * @property {string} socketId - Socket connection ID
++ * @property {boolean} isLeader - Whether this player is the leader
++ * @property {boolean} [isHost] - Whether this player is the host
++ * @property {boolean} [isReady] - Whether this player is ready
++ * @property {any} joinedAt - Firebase timestamp
++ */
++
++/**
++ * @typedef {Object} SocketContextType
++ * @property {any} socket - Socket.io instance
++ * @property {boolean} isConnected - Whether socket is connected
++ * @property {string|null} currentRoom - Current room code
++ * @property {Player[]} players - Array of players in the room
++ * @property {Player|null} leader - Current leader player
++ * @property {Object|null} gameState - Current game state
++ * @property {string|null} error - Current error message
++ * @property {function(string): boolean} amILeader - Function to check if given ID is leader
++ * @property {function(string, string, string, string=): void} createRoom - Create a new room
++ * @property {function(string, string, string): void} joinRoom - Join an existing room
++ * @property {function(string): void} setNewLeader - Set a new leader
++ * @property {function(string): void} toggleReady - Toggle player ready status
++ * @property {function(Object): void} updateGameState - Update game state
++ * @property {function(string, string): void} syncLoginInput - Sync login input
++ * @property {function(string): void} syncTerminalInput - Sync terminal input
++ * @property {function(number): void} syncCursorPosition - Sync cursor position
++ */
++
++/** @type {React.Context<SocketContextType|null>} */
+ const SocketContext = createContext(null);
+ 
+ export const useSocket = () => {
+@@ -17,6 +49,7 @@ export const SocketProvider = ({ children }) => {
+   const [socket, setSocket] = useState(null);
+   const [isConnected, setIsConnected] = useState(false);
+   const [currentRoom, setCurrentRoom] = useState(null);
++  /** @type {[Player[], Function]} */
+   const [players, setPlayers] = useState([]);
+   const [leader, setLeader] = useState(null);
+   const [gameState, setGameState] = useState(null);
+@@ -125,9 +158,9 @@ export const SocketProvider = ({ children }) => {
+   }, [currentRoom, players]);
+ 
+   // Methods for interacting with the socket
+-  const createRoom = (roomName, hostName, hostId) => {
++  const createRoom = (roomName, hostName, hostId, customCode) => {
+     if (socket && isConnected) {
+-      socket.emit('createRoom', { roomName, hostName, hostId });
++      socket.emit('createRoom', { roomName, hostName, hostId, customCode });
+     }
+   };
+ 
+@@ -144,6 +177,12 @@ export const SocketProvider = ({ children }) => {
+     }
+   };
+ 
++  const toggleReady = (playerId) => {
++    if (socket && isConnected && currentRoom) {
++      socket.emit('toggleReady', { roomCode: currentRoom, playerId });
++    }
++  };
++
+   const updateGameState = (newState) => {
+     if (socket && isConnected && currentRoom) {
+       socket.emit('updateGameState', { 
+@@ -185,6 +224,7 @@ export const SocketProvider = ({ children }) => {
+     createRoom,
+     joinRoom,
+     setNewLeader,
++    toggleReady,
+     updateGameState,
+     syncLoginInput,
+     syncTerminalInput,
+-- 
+2.47.0.windows.2
+
