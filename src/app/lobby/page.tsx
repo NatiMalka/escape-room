@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useSocket } from '@/context/SocketContext';
@@ -43,7 +43,11 @@ export default function Lobby() {
     joinRoom,
     setNewLeader,
     toggleReady,
-    amILeader 
+    amILeader,
+    startGame,
+    shouldShowVideo,
+    setShouldShowVideo,
+    socket
   } = useSocket();
   
   const [playerName, setPlayerName] = useState('');
@@ -53,12 +57,16 @@ export default function Lobby() {
   const [isCreatingRoom, setIsCreatingRoom] = useState(false);
   const [isJoiningRoom, setIsJoiningRoom] = useState(false);
   const [hasJoinedRoom, setHasJoinedRoom] = useState(false);
-  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
   const [showSkipButton, setShowSkipButton] = useState(false);
   const [votingActive, setVotingActive] = useState(false);
   const [votedForId, setVotedForId] = useState<string | null>(null);
   const [startingGame, setStartingGame] = useState(false);
   const [showCopiedMessage, setShowCopiedMessage] = useState(false);
+  const [isHost, setIsHost] = useState(false);
+  const [videoCompleted, setVideoCompleted] = useState(false);
+  
+  // Video ref for controlling video
+  const videoRef = useRef<HTMLVideoElement>(null);
   
   // Generate a player ID on initial render if not already in localStorage
   useEffect(() => {
@@ -95,6 +103,7 @@ export default function Lobby() {
           setRoomName(createRoomData.roomName);
           setPlayerName(createRoomData.hostName);
           setPlayerId(createRoomData.hostId);
+          setIsHost(true);
           
           // Store player name in playerInfo
           localStorage.setItem('playerInfo', JSON.stringify({ 
@@ -126,33 +135,54 @@ export default function Lobby() {
           if (joinRoomDataString) {
             const joinRoomData: JoinRoomData = JSON.parse(joinRoomDataString);
             
+            console.log('Found join data:', joinRoomData);
+            
+            // Make sure we have a player ID
+            if (!playerId) {
+              const newId = uuidv4();
+              setPlayerId(newId);
+              
+              // Store in local storage and try again on next render
+              localStorage.setItem('playerInfo', JSON.stringify({ 
+                id: newId,
+                name: joinRoomData.playerName 
+              }));
+              return;
+            }
+            
             // Update local state
             setPlayerName(joinRoomData.playerName);
             setRoomCode(joinRoomData.roomCode);
             
-            // Store player name in playerInfo
-            if (playerId) {
-              localStorage.setItem('playerInfo', JSON.stringify({ 
-                id: playerId,
-                name: joinRoomData.playerName 
-              }));
-              
-              // Join the room
-              if (typeof joinRoom === 'function') {
-                joinRoom(joinRoomData.roomCode, joinRoomData.playerName, playerId);
-                setHasJoinedRoom(true);
-              }
-            }
+            console.log('Joining room with:', {
+              roomCode: joinRoomData.roomCode,
+              playerName: joinRoomData.playerName,
+              playerId
+            });
             
-            // Clear the join room data after using it
-            localStorage.removeItem('joinRoomData');
+            // Store player name in playerInfo
+            localStorage.setItem('playerInfo', JSON.stringify({ 
+              id: playerId,
+              name: joinRoomData.playerName 
+            }));
+            
+            // Join the room
+            if (typeof joinRoom === 'function') {
+              joinRoom(joinRoomData.roomCode, joinRoomData.playerName, playerId);
+              setHasJoinedRoom(true);
+              
+              // Clear the join room data after using it
+              localStorage.removeItem('joinRoomData');
+            } else {
+              console.error('joinRoom function is not available');
+            }
           }
         }
       } catch (error) {
         console.error('Failed to process room data:', error);
       }
     }
-  }, [isConnected, currentRoom, hasJoinedRoom, playerId]);
+  }, [isConnected, currentRoom, hasJoinedRoom, playerId, joinRoom]);
   
   // Store player name when it changes
   useEffect(() => {
@@ -174,19 +204,128 @@ export default function Lobby() {
     
     setStartingGame(true);
     
-    // Store mission start time and team info in localStorage
-    localStorage.setItem('escapeRoomTeam', JSON.stringify({
-      team: { name: roomName || `Room ${currentRoom}`, agents: players ? players.length : 0 },
-      gameCode: currentRoom,
-      startTime: new Date().toISOString(),
-      connectedAgents: players ? players.length : 0
-    }));
-    
-    // Navigate to game
-    setTimeout(() => {
-      router.push('/game');
-    }, 1000);
+    // Use the socket context's startGame function to broadcast to all players
+    if (typeof startGame === 'function') {
+      startGame();
+    } else {
+      console.error('startGame function is not available');
+    }
   };
+  
+  // Handle video end
+  const handleVideoEnded = () => {
+    console.log('Video ended, starting game for everyone');
+    setVideoCompleted(true);
+    
+    // Only proceed to start the game if we're not already in process
+    if (!window.location.pathname.includes('/game')) {
+      // Manually trigger startGame via socket if we're the host
+      if (isHost) {
+        console.log('Host is starting game after video completed');
+        // Use socket directly to send startGame event
+        if (socket && isConnected && currentRoom) {
+          // Exit fullscreen if needed
+          try {
+            if (document.fullscreenElement) {
+              document.exitFullscreen().catch(err => {
+                console.error('Error exiting fullscreen:', err);
+              });
+            }
+          } catch (err) {
+            console.error('Error checking fullscreen state:', err);
+          }
+          
+          // Short delay to allow fullscreen exit
+          setTimeout(() => {
+            socket.emit('startGame', { roomCode: currentRoom });
+            setShouldShowVideo(false);
+          }, 500);
+        }
+      }
+    }
+  };
+  
+  // Skip video (for testing or if user wants to skip)
+  const handleSkipVideo = () => {
+    setVideoCompleted(true);
+    
+    // Only trigger game start if we're the host
+    if (isHost) {
+      console.log('Host is skipping video, starting game for everyone');
+      
+      // Exit fullscreen if needed
+      try {
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(err => {
+            console.error('Error exiting fullscreen:', err);
+          });
+        }
+      } catch (err) {
+        console.error('Error checking fullscreen state:', err);
+      }
+      
+      if (socket && isConnected && currentRoom) {
+        socket.emit('startGame', { roomCode: currentRoom });
+        setShouldShowVideo(false);
+      }
+    } else {
+      // For non-hosts, just hide the video
+      setShouldShowVideo(false);
+    }
+  };
+  
+  // Show skip button after 3 seconds
+  useEffect(() => {
+    if (shouldShowVideo) {
+      const timer = setTimeout(() => {
+        setShowSkipButton(true);
+      }, 3000);
+      
+      return () => clearTimeout(timer);
+    } else {
+      setShowSkipButton(false);
+    }
+  }, [shouldShowVideo]);
+
+  // Try to play the video once loaded
+  useEffect(() => {
+    if (shouldShowVideo && videoRef.current) {
+      console.log('Attempting to play video');
+      
+      // Add event listener to play when data is loaded
+      const videoElement = videoRef.current;
+      const playVideo = () => {
+        console.log('Video data loaded, attempting to play');
+        videoElement.play()
+          .then(() => console.log('Video playing successfully'))
+          .catch(err => console.error('Error playing video:', err));
+      };
+      
+      videoElement.addEventListener('loadeddata', playVideo);
+      
+      // Also try to play immediately
+      const playPromise = videoElement.play();
+      
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            console.log('Video started playing immediately');
+          })
+          .catch(error => {
+            console.error('Error playing video immediately:', error);
+          });
+      }
+      
+      return () => {
+        videoElement.removeEventListener('loadeddata', playVideo);
+      };
+    }
+  }, [shouldShowVideo]);
+
+  // Add a log whenever shouldShowVideo changes
+  useEffect(() => {
+    console.log('shouldShowVideo changed:', shouldShowVideo);
+  }, [shouldShowVideo]);
 
   // Navigate to game when the countdown is complete
   useEffect(() => {
@@ -204,44 +343,36 @@ export default function Lobby() {
   const handleCreateWithRandomCode = (roomName: string, hostName: string, hostId: string) => {
     if (typeof createRoom === 'function') {
       createRoom(roomName, hostName, hostId);
-      setIsCreatingRoom(false);
       setHasJoinedRoom(true);
-    }
+    } 
   };
-
+  
   const handleCreateWithCustomCode = (roomName: string, hostName: string, hostId: string, customCode: string) => {
     if (typeof createRoom === 'function') {
-      // The server should handle creating with a custom code
-      // For now, we'll just use the createRoom function
       createRoom(roomName, hostName, hostId, customCode);
-      setIsCreatingRoom(false);
+      setRoomCode(customCode);
       setHasJoinedRoom(true);
     }
   };
-
+  
+  // Add an error message displayed to the user for debugging purposes
+  useEffect(() => {
+    if (error) {
+      console.error('Room error:', error);
+    }
+  }, [error]);
+  
   const handleCreateRoom = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!playerName.trim() || !roomName.trim()) return;
-
-    handleCreateWithRandomCode(roomName, playerName, playerId);
+    // Functionality moved to homepage
   };
-
+  
   const handleJoinRoom = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!playerName.trim() || !roomCode.trim()) return;
-
-    if (typeof joinRoom === 'function') {
-      joinRoom(roomCode.toUpperCase(), playerName, playerId);
-      setIsJoiningRoom(false);
-      setHasJoinedRoom(true);
-    }
+    // Functionality moved to homepage
   };
-
+  
   const handleVoteForLeader = (id: string) => {
-    if (id === playerId) return; // Can't vote for yourself
-    
-    // In a real implementation, this would send a vote to the server
-    // For now, we'll just update the local state
     setVotedForId(id);
   };
   
@@ -281,6 +412,67 @@ export default function Lobby() {
     return players.every((player: Player) => player.isReady === true);
   };
 
+  // Add a sort function to sort players by join time
+  const sortPlayersByJoinTime = (playerList: Player[]) => {
+    if (!playerList || !Array.isArray(playerList)) return [];
+    
+    return [...playerList].sort((a, b) => {
+      // Handle different timestamp formats
+      const timeA = a.joinedAt ? 
+        (typeof a.joinedAt === 'string' ? new Date(a.joinedAt).getTime() : a.joinedAt.toDate?.().getTime() || 0) 
+        : 0;
+      
+      const timeB = b.joinedAt ? 
+        (typeof b.joinedAt === 'string' ? new Date(b.joinedAt).getTime() : b.joinedAt.toDate?.().getTime() || 0) 
+        : 0;
+      
+      return timeA - timeB;
+    });
+  };
+
+  // Add a function to request room state
+  const requestRoomState = () => {
+    if (isConnected && currentRoom) {
+      console.log('Manually requesting room state for:', currentRoom);
+      if (typeof joinRoom === 'function') {
+        // Re-use existing join information as a way to refresh
+        joinRoom(currentRoom, playerName || 'Player', playerId);
+      }
+    }
+  };
+
+  // Add an effect to automatically request room state if we're connected but don't have players
+  useEffect(() => {
+    if (isConnected && currentRoom && hasJoinedRoom && (!players || players.length === 0)) {
+      console.log('No players detected, requesting room state');
+      const timer = setTimeout(() => {
+        requestRoomState();
+      }, 2000);
+      
+      return () => clearTimeout(timer);
+    }
+  }, [isConnected, currentRoom, hasJoinedRoom, players]);
+
+  // Add an effect to periodically refresh the room state
+  useEffect(() => {
+    if (isConnected && currentRoom && hasJoinedRoom) {
+      console.log('Setting up periodic room state refresh');
+      
+      // Refresh every 5 seconds
+      const refreshInterval = setInterval(() => {
+        if (typeof joinRoom === 'function') {
+          console.log('Periodic room state refresh');
+          // Use requestRoomState instead of re-joining
+          requestRoomState();
+        }
+      }, 5000);
+      
+      return () => {
+        clearInterval(refreshInterval);
+      };
+    }
+  }, [isConnected, currentRoom, hasJoinedRoom]);
+
   // If already joined a room, show the waiting room
   if (hasJoinedRoom && currentRoom) {
     // Get current player details
@@ -288,325 +480,310 @@ export default function Lobby() {
       ? players.find((p: Player) => p.id === playerId) 
       : undefined;
     
+    const canStartGame = players && Array.isArray(players) && players.length > 1;
+    
+    // Sort players by join time
+    const sortedPlayers = sortPlayersByJoinTime(players);
+    
+    // Video overlay
+    if (shouldShowVideo) {
+      return (
+        <div className="fixed inset-0 bg-black z-50 flex flex-col items-center justify-center">
+          <div className="text-white text-xl font-bold mb-6">
+            INCOMING TRANSMISSION...
+          </div>
+          <div className="w-full h-screen bg-black flex items-center justify-center">
+            <video
+              ref={videoRef}
+              src={`/Hacker Computer  Mask Criminal.mp4`}
+              className="w-full h-full object-contain"
+              autoPlay
+              playsInline
+              muted={false}
+              loop={false}
+              preload="auto"
+              onLoadedData={() => {
+                console.log('Video data loaded from onLoadedData prop');
+                if (videoRef.current) {
+                  // Request fullscreen
+                  try {
+                    const videoElement = videoRef.current;
+                    // Play first, then request fullscreen after a short delay
+                    videoElement.play()
+                      .then(() => {
+                        console.log('Video playing from onLoadedData');
+                        // Short delay to ensure playback has started before going fullscreen
+                        setTimeout(() => {
+                          if (videoElement.requestFullscreen) {
+                            videoElement.requestFullscreen().catch(err => {
+                              console.error('Error attempting to enable fullscreen:', err);
+                            });
+                          } else if ((videoElement as any).webkitRequestFullscreen) {
+                            (videoElement as any).webkitRequestFullscreen();
+                          } else if ((videoElement as any).msRequestFullscreen) {
+                            (videoElement as any).msRequestFullscreen();
+                          }
+                        }, 1000);
+                      })
+                      .catch(err => {
+                        console.error('Error playing from onLoadedData:', err);
+                        // If we can't play automatically, show controls
+                        videoElement.controls = true;
+                      });
+                  } catch (err) {
+                    console.error('Fullscreen error:', err);
+                    if (videoRef.current) {
+                      videoRef.current.controls = true;
+                    }
+                  }
+                }
+              }}
+              onEnded={handleVideoEnded}
+              onClick={() => {
+                // On video click, try to play if it's paused
+                if (videoRef.current && videoRef.current.paused) {
+                  videoRef.current.play().catch(err => {
+                    console.error('Error playing video on click:', err);
+                  });
+                }
+              }}
+              style={{ maxHeight: '100vh' }}
+            />
+          </div>
+          
+          {showSkipButton && isHost && (
+            <button 
+              onClick={handleSkipVideo}
+              className="fixed bottom-6 right-6 px-6 py-3 bg-red-700 hover:bg-red-600 text-white rounded-md text-lg font-medium z-50"
+            >
+              Skip Transmission
+            </button>
+          )}
+          
+          <div className="fixed bottom-6 left-6 text-sm text-gray-400 max-w-md z-50">
+            This transmission contains critical mission information. Please watch the entire video.
+          </div>
+        </div>
+      );
+    }
+    
     return (
-      <div className="min-h-screen bg-gray-900 text-white flex flex-col">
-        <div className="bg-black p-4">
+      <div className="min-h-screen bg-black text-white flex flex-col">
+        <div className="bg-gray-900 p-4 border-b border-blue-900/50">
           <div className="container mx-auto">
-            <h1 className="text-2xl font-bold text-blue-500">TOMAX Security</h1>
+            <h1 className="text-2xl font-bold text-blue-500">SYSTEM BREACH - LOBBY</h1>
           </div>
         </div>
         
         <div className="flex-1 container mx-auto p-6">
-          <div className="bg-black/50 p-6 rounded-lg border border-blue-900/50 mb-8">
-            <h2 className="text-xl font-bold mb-4">Room: {roomName || `Room ${currentRoom}`}</h2>
-            <div className="bg-gray-800/50 p-4 rounded mb-4">
-              <div className="flex items-center justify-between">
-                <p className="font-mono">Room Code: <span className="text-yellow-400">{currentRoom}</span></p>
-                <button 
-                  onClick={handleCopyRoomCode} 
-                  className="px-3 py-1 bg-blue-900/70 hover:bg-blue-800 rounded-md text-sm ml-4"
+          <div className="bg-gray-900/50 p-6 rounded-lg border border-blue-900/50 mb-8">
+            <div className="flex flex-col md:flex-row justify-between items-start mb-8 gap-6">
+              <div className="flex-1">
+                <h2 className="text-2xl font-bold mb-2 text-blue-400">{roomName || `Room ${currentRoom}`}</h2>
+                <div className="flex items-center">
+                  <div className={`w-2 h-2 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                  <p className="text-gray-400">
+                    {isConnected ? 'Connected to server' : 'Connecting...'}
+                  </p>
+                </div>
+              </div>
+              
+              <div className="w-full md:w-auto bg-gray-800/70 p-4 rounded-md border border-blue-900/50 flex flex-col">
+                <p className="text-center mb-2 font-medium">JOIN CODE</p>
+                <div className="flex items-center gap-3 justify-center">
+                  <div className="font-mono text-lg md:text-xl text-yellow-400 bg-gray-900/70 px-4 py-2 rounded-md tracking-wider border border-gray-700">
+                    {currentRoom}
+                  </div>
+                  <button 
+                    onClick={handleCopyRoomCode} 
+                    className="bg-blue-900 hover:bg-blue-800 text-white py-2 px-3 rounded-md flex items-center text-sm"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                    </svg>
+                    Copy
+                  </button>
+                </div>
+                {showCopiedMessage && (
+                  <p className="text-green-400 text-xs mt-2 text-center">Copied to clipboard!</p>
+                )}
+                <button
+                  onClick={requestRoomState}
+                  className="mt-2 text-xs text-blue-400 hover:text-blue-300 flex items-center justify-center"
                 >
-                  Copy Code
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  Refresh Connection
                 </button>
               </div>
-              {showCopiedMessage && (
-                <p className="text-green-400 text-xs mt-1">Copied to clipboard!</p>
-              )}
-              <p className="text-sm text-gray-400 mt-2">Share this code with your team members</p>
             </div>
             
-            
-              <div className="flex justify-between items-center mb-2">
-                <h3 className="text-lg font-bold">Connected Agents ({players && Array.isArray(players) ? players.length : 0})</h3>
-                
-                {!votingActive && !leader && players && Array.isArray(players) && players.length > 1 && (
-                  <button
-                    onClick={handleStartVoting}
-                    className="px-3 py-1 bg-blue-700 hover:bg-blue-600 rounded-md text-sm"
-                  >
-                    Start Leader Vote
-                  </button>
-                )}
-              </div>
+            {/* Players list */}
+            <div className="mb-8">
+              <h3 className="text-lg font-bold mb-4 text-blue-300 flex items-center">
+                <span>PLAYERS</span>
+                <span className="ml-2 bg-blue-900/50 text-xs px-2 py-0.5 rounded-full">
+                  {sortedPlayers.length} CONNECTED
+                </span>
+                <span className="ml-2 text-xs text-gray-400">
+                  (auto-refreshes every 5s)
+                </span>
+              </h3>
               
               <div className="space-y-2">
-                {players && Array.isArray(players) && players.map((player: Player) => (
-                  <div key={player.id} className="flex items-center justify-between bg-gray-800 p-2 rounded">
-                    <div className="flex items-center">
-                      <div className={`w-3 h-3 rounded-full mr-2 ${player.isLeader ? 'bg-green-500' : 'bg-gray-500'}`}></div>
-                      <span>{player.name}</span>
-                      {player.isLeader && <span className="ml-2 text-xs bg-green-900/50 px-2 py-0.5 rounded text-green-400">LEADER</span>}
-                      {player.isHost && <span className="ml-2 text-xs bg-blue-900/50 px-2 py-0.5 rounded text-blue-400">HOST</span>}
-                      {player.isReady && <span className="ml-2 text-xs bg-yellow-900/50 px-2 py-0.5 rounded text-yellow-400">READY</span>}
-                      {votingActive && votedForId === player.id && (
-                        <span className="ml-2 text-xs bg-purple-900/50 px-2 py-0.5 rounded text-purple-400">VOTED</span>
-                      )}
-                    </div>
-                    
-                    <div className="flex gap-2 items-center">
-                      {/* Ready status indicator */}
-                      <div className={`h-5 w-5 flex items-center justify-center rounded-full border ${
-                        player.isReady 
-                          ? 'border-green-500 bg-green-900/30' 
-                          : 'border-red-500 bg-red-900/30'
-                        }`}
-                      >
-                        {player.isReady 
-                          ? <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-green-500" viewBox="0 0 20 20" fill="currentColor">
-                              <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                            </svg>
-                          : <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-red-500" viewBox="0 0 20 20" fill="currentColor">
-                              <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
-                            </svg>
-                        }
+                {sortedPlayers.map((player: Player) => {
+                  // Format join time
+                  const joinTime = player.joinedAt ? 
+                    (typeof player.joinedAt === 'string' ? 
+                      new Date(player.joinedAt) : 
+                      player.joinedAt.toDate?.()) : 
+                    null;
+                  
+                  const joinTimeDisplay = joinTime ? 
+                    joinTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : 
+                    'Unknown';
+                  
+                  return (
+                    <div key={player.id} className="flex items-center justify-between bg-gray-800/70 p-3 rounded-md border border-gray-700/50">
+                      <div className="flex items-center">
+                        <div className="w-3 h-3 rounded-full mr-2 bg-green-500"></div>
+                        <span className="font-medium">{player.name}</span>
+                        {player.isHost && <span className="ml-2 text-xs bg-blue-900/50 px-2 py-0.5 rounded text-blue-400">HOST</span>}
                       </div>
-
-                      {/* Ready toggle button for current player */}
-                      {player.id === playerId && (
-                        <button
-                          onClick={handleToggleReady}
-                          className={`px-3 py-1 rounded-md text-xs ${
-                            player.isReady 
-                              ? 'bg-red-700 hover:bg-red-600 text-white' 
-                              : 'bg-green-700 hover:bg-green-600 text-white'
-                          }`}
-                        >
-                          {player.isReady ? 'Not Ready' : 'Ready'}
-                        </button>
-                      )}
-                      
-                      {/* Leader vote button */}
-                      {votingActive && player.id !== playerId && (
-                        <button
-                          onClick={() => handleVoteForLeader(player.id)}
-                          className={`px-3 py-1 ${
-                            votedForId === player.id 
-                              ? 'bg-purple-700' 
-                              : 'bg-blue-900 hover:bg-blue-800'
-                          } rounded-md text-xs`}
-                        >
-                          {votedForId === player.id ? 'Voted' : 'Vote Leader'}
-                        </button>
-                      )}
+                      <div className="text-xs text-gray-400">
+                        Joined at {joinTimeDisplay}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
                 
-                {votingActive && (
-                  <div className="mt-4">
-                    <button
-                      onClick={handleEndVoting}
-                      className="px-4 py-2 bg-red-700 hover:bg-red-600 rounded-md text-sm"
-                    >
-                      End Voting
-                    </button>
+                {(!sortedPlayers || sortedPlayers.length === 0) && (
+                  <div className="bg-gray-800/40 p-4 rounded-md text-center text-gray-400 italic">
+                    No players have joined yet
                   </div>
                 )}
               </div>
+            </div>
             
-              {/* Ready status progress indicator */}
-              {players && Array.isArray(players) && players.length > 0 && (
-                <div className="mt-4 p-3 bg-gray-800/70 rounded-md">
-                  <div className="flex justify-between items-center mb-2">
-                    <span className="text-sm">Ready Status:</span>
-                    <span className="text-sm">
-                      {players.filter(p => p.isReady).length} / {players.length} agents ready
-                    </span>
-                  </div>
-                  <div className="w-full bg-gray-700 h-2 rounded-full overflow-hidden">
-                    <div 
-                      className="bg-green-600 h-full rounded-full transition-all duration-500 ease-in-out"
-                      style={{ 
-                        width: `${players.filter(p => p.isReady).length / players.length * 100}%`,
-                      }}
-                    ></div>
-                  </div>
-                  {players.every(p => p.isReady) ? (
-                    <p className="text-green-400 text-xs mt-2 text-center">All agents ready!</p>
-                  ) : (
-                    <p className="text-yellow-400 text-xs mt-2 text-center">
-                      Waiting for {players.length - players.filter(p => p.isReady).length} more agent(s) to be ready
-                    </p>
-                  )}
-                </div>
-              )}
-            
-            <div className="mt-6">
-              <p className="mb-4 text-gray-300">
-                {leader 
-                  ? "The team leader will control inputs during the mission. When everyone is ready, the leader can start the mission."
-                  : "Select a team leader before starting the mission. The leader will control inputs while others provide support."
-                }
+            <div className="bg-gray-800/50 p-4 rounded-md mb-8 border border-blue-900/30">
+              <p className="text-gray-300">
+                Share the join code with other players so they can join your mission.
               </p>
+            </div>
+            
+            {/* Action buttons */}
+            <div className="flex justify-between items-center">
+              <Link href="/" className="text-blue-400 hover:text-blue-300">
+                Back to Home
+              </Link>
               
-              {leader && typeof amILeader === 'function' && playerId && amILeader(playerId) && (
+              {isHost && (
                 <button
                   onClick={handleStartGame}
-                  disabled={startingGame || !areAllPlayersReady()}
-                  className={`w-full py-3 rounded-md font-bold ${
-                    startingGame 
+                  disabled={!canStartGame || startingGame}
+                  className={`px-6 py-3 rounded-md font-bold ${
+                    !canStartGame || startingGame
                       ? 'bg-gray-700 cursor-not-allowed' 
-                      : !areAllPlayersReady()
-                        ? 'bg-gray-700 cursor-not-allowed'
-                        : 'bg-blue-700 hover:bg-blue-600 animate-pulse shadow-[0_0_15px_rgba(37,99,235,0.5)]'
+                      : 'bg-green-700 hover:bg-green-600'
                   }`}
                 >
-                  {startingGame 
-                    ? 'Starting Mission...' 
-                    : !areAllPlayersReady()
-                      ? 'Waiting for all agents to be ready...'
-                      : 'Start Mission'
-                  }
+                  {startingGame ? 'Starting...' : 'Start Game'}
                 </button>
               )}
-              
-              {(!leader || typeof amILeader !== 'function' || !playerId || !amILeader(playerId)) && (
-                <div className="p-3 bg-gray-800/80 rounded-md text-center">
-                  {leader 
-                    ? areAllPlayersReady()
-                      ? "All agents ready! Waiting for the leader to start the mission..."
-                      : "Waiting for the leader to start the mission..."
-                    : "Waiting for a team leader to be selected..."
-                  }
-                </div>
-              )}
-              
-              <div className="mt-3 text-center text-xs text-gray-500">
-                <p>All agents must be ready before the mission can start.</p>
-                <p className="mt-1">The leader will have control of mission inputs while other agents provide support.</p>
-              </div>
             </div>
+            
+            {isHost && !canStartGame && (
+              <p className="text-yellow-400 text-sm mt-2 text-center">
+                At least one more player needs to join before you can start the game
+              </p>
+            )}
           </div>
         </div>
       </div>
     );
   }
 
-  // Show the initial lobby screen for creating or joining a room
-  return (
-    <div className="min-h-screen bg-gray-900 text-white flex flex-col">
-      <div className="bg-black p-4">
-        <div className="container mx-auto">
-          <h1 className="text-2xl font-bold text-blue-500">TOMAX Security</h1>
+  // Loading state while connecting
+  if (!isConnected) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-black">
+        <div className="text-white text-xl">Connecting to server...</div>
+      </div>
+    );
+  }
+
+  // Error state
+  if (error) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-black p-4">
+        <div className="max-w-md w-full bg-gray-900/80 backdrop-blur-sm rounded-lg p-6 border border-red-900/50">
+          <h2 className="text-xl font-bold mb-4 text-red-400">Connection Error</h2>
+          <p className="text-white mb-4">{error}</p>
+          <div className="bg-gray-800/70 p-4 rounded-md mb-6 text-sm text-gray-400">
+            <p className="mb-2">Troubleshooting tips:</p>
+            <ul className="list-disc pl-5 space-y-1">
+              <li>Check if the server is running</li>
+              <li>Try creating a room with a different code</li>
+              <li>Refresh the page and try again</li>
+              <li>Clear your browser cache and cookies</li>
+            </ul>
+          </div>
+          <div className="flex gap-3">
+            <Link href="/" className="flex-1 block py-3 bg-blue-700 hover:bg-blue-600 text-white font-bold rounded-md text-center">
+              Back to Home
+            </Link>
+            <button 
+              onClick={() => {
+                // Clear storage and reload
+                localStorage.removeItem('createRoomData');
+                localStorage.removeItem('joinRoomData');
+                window.location.reload();
+              }}
+              className="py-3 px-4 bg-green-700 hover:bg-green-600 rounded-md text-white"
+            >
+              Reset & Retry
+            </button>
+          </div>
         </div>
       </div>
-      
-      <div className="flex-1 container mx-auto p-6">
-        <div className="max-w-3xl mx-auto">
-          <div className="p-6 bg-black/50 rounded-lg border border-blue-900/50 mb-8">
-            <h2 className="text-2xl font-bold mb-4 text-center">Multiplayer Mission</h2>
-            
-            <p className="mb-6 text-center text-gray-300">
-              Work together as a team to infiltrate the compromised system. One agent will lead the operation while others provide support.
-            </p>
-            
-            {!isCreatingRoom && !isJoiningRoom && (
-              <div className="space-y-4">
-              <div
-                className={`p-4 border rounded-md ${isCreatingRoom ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 hover:border-blue-700 bg-gray-800/30 hover:bg-gray-800/50'} cursor-pointer transition-colors`}
-                onClick={() => {
-                  setIsCreatingRoom(true);
-                  setIsJoiningRoom(false);
-                }}
-              >
-                <h3 className="text-lg font-bold mb-2">Create a Room</h3>
-                <p className="text-sm text-gray-400">Start a new mission and invite other agents to join you.</p>
-              </div>
-              
-              <div
-                className={`p-4 border rounded-md ${isJoiningRoom ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 hover:border-blue-700 bg-gray-800/30 hover:bg-gray-800/50'} cursor-pointer transition-colors`}
-                onClick={() => {
-                  setIsJoiningRoom(true);
-                  setIsCreatingRoom(false);
-                }}
-              >
-                <h3 className="text-lg font-bold mb-2">Join a Room</h3>
-                <p className="text-sm text-gray-400">Enter a room code to join an existing mission.</p>
-              </div>
+    );
+  }
+
+  // Default: Show loading state
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-black p-4">
+      <div className="max-w-md w-full">
+        <div className="bg-gray-900/80 backdrop-blur-sm rounded-lg p-6 border border-blue-900/50">
+          <h2 className="text-xl font-bold mb-4 text-center text-blue-400">Connecting to Lobby</h2>
+          <div className="flex justify-center items-center my-8">
+            <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div>
+          </div>
+          <p className="text-center text-gray-400 mb-6">Please wait while we connect you to the game lobby...</p>
+          
+          <div className="text-center">
+            <button
+              onClick={() => {
+                // Clear localStorage and reload
+                localStorage.removeItem('joinRoomData');
+                window.location.reload();
+              }}
+              className="px-4 py-2 bg-blue-900 hover:bg-blue-800 text-white text-sm rounded-md inline-flex items-center"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              Retry Connection
+            </button>
+          </div>
+          
+          <div className="mt-4 border-t border-gray-800 pt-4">
+            <p className="text-center text-xs text-gray-500">Connection taking too long? Try going back and creating a new game instead.</p>
+            <div className="mt-3 text-center">
+              <Link href="/" className="text-blue-400 hover:text-blue-300 text-sm">
+                &larr; Back to Home
+              </Link>
             </div>
-            )}
-            
-            {isCreatingRoom && (
-              <div className="mt-6 p-4 bg-gray-800/50 rounded-md">
-                <h3 className="text-lg font-bold mb-4">Create a New Mission</h3>
-                <form onSubmit={handleCreateRoom} className="space-y-4">
-                  <div>
-                    <label htmlFor="playerName" className="block text-sm text-gray-400 mb-1">Your Name</label>
-                    <input
-                      id="playerName"
-                      type="text"
-                      value={playerName}
-                      onChange={(e) => setPlayerName(e.target.value)}
-                      className="w-full p-2 bg-gray-900 border border-gray-700 rounded-md focus:outline-none focus:border-blue-500"
-                      placeholder="Enter your agent name"
-                      required
-                    />
-                  </div>
-                  
-                  <div>
-                    <label htmlFor="roomName" className="block text-sm text-gray-400 mb-1">Room Name</label>
-                    <input
-                      id="roomName"
-                      type="text"
-                      value={roomName}
-                      onChange={(e) => setRoomName(e.target.value)}
-                      className="w-full p-2 bg-gray-900 border border-gray-700 rounded-md focus:outline-none focus:border-blue-500"
-                      placeholder="Name your mission room"
-                      required
-                    />
-                  </div>
-                  
-                  <button
-                    type="submit"
-                    className="w-full py-2 bg-blue-700 hover:bg-blue-600 rounded-md"
-                  >
-                    Create Room
-                  </button>
-                </form>
-              </div>
-            )}
-            
-            {isJoiningRoom && (
-              <div className="mt-6 p-4 bg-gray-800/50 rounded-md">
-                <h3 className="text-lg font-bold mb-4">Join an Existing Mission</h3>
-                <form onSubmit={handleJoinRoom} className="space-y-4">
-                  <div>
-                    <label htmlFor="playerName" className="block text-sm text-gray-400 mb-1">Your Name</label>
-                    <input
-                      id="playerName"
-                      type="text"
-                      value={playerName}
-                      onChange={(e) => setPlayerName(e.target.value)}
-                      className="w-full p-2 bg-gray-900 border border-gray-700 rounded-md focus:outline-none focus:border-blue-500"
-                      placeholder="Enter your agent name"
-                      required
-                    />
-                  </div>
-                  
-                  <div>
-                    <label htmlFor="roomCode" className="block text-sm text-gray-400 mb-1">Room Code</label>
-                    <input
-                      id="roomCode"
-                      type="text"
-                      value={roomCode}
-                      onChange={(e) => setRoomCode(e.target.value.toUpperCase())}
-                      className="w-full p-2 bg-gray-900 border border-gray-700 rounded-md focus:outline-none focus:border-blue-500 uppercase"
-                      placeholder="Enter 6-character room code"
-                      maxLength={6}
-                      required
-                    />
-                  </div>
-                  
-                  <button
-                    type="submit"
-                    className="w-full py-2 bg-blue-700 hover:bg-blue-600 rounded-md"
-                  >
-                    Join Room
-                  </button>
-                </form>
-              </div>
-            )}
-            
           </div>
         </div>
       </div>

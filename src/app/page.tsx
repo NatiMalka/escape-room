@@ -19,8 +19,12 @@ export default function Home() {
   const router = useRouter();
   const [joinCode, setJoinCode] = useState('');
   const [playerName, setPlayerName] = useState('');
+  const [lobbyName, setLobbyName] = useState('');
+  const [hostName, setHostName] = useState('');
   const [joinError, setJoinError] = useState('');
+  const [hostError, setHostError] = useState('');
   const [showJoinForm, setShowJoinForm] = useState(false);
+  const [showHostForm, setShowHostForm] = useState(false);
   const [backgroundLines, setBackgroundLines] = useState<BackgroundLine[]>([]);
   const containerRef = useRef(null);
 
@@ -62,6 +66,49 @@ export default function Home() {
     localStorage.setItem('joinRoomData', JSON.stringify({
       roomCode: joinCode.toUpperCase(),
       playerName: playerName
+    }));
+    
+    router.push('/lobby');
+  };
+
+  const handleHostRoom = (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    if (!lobbyName.trim()) {
+      setHostError('Please enter a lobby name');
+      return;
+    }
+    
+    if (!hostName.trim()) {
+      setHostError('Please enter your name');
+      return;
+    }
+    
+    // Generate a random 6-digit alphanumeric join code
+    // Only use uppercase letters and numbers to avoid confusion
+    const characters = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // removed similar looking characters (I, O, 0, 1)
+    let joinCode = '';
+    for (let i = 0; i < 6; i++) {
+      joinCode += characters.charAt(Math.floor(Math.random() * characters.length));
+    }
+    
+    console.log('Generated join code:', joinCode);
+    
+    // Generate a host ID
+    let hostId = '';
+    try {
+      hostId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15);
+    } catch (err) {
+      // Fallback if randomUUID fails
+      hostId = Date.now().toString(36) + Math.random().toString(36).substring(2, 10);
+    }
+    
+    // Store the data for the room creation
+    localStorage.setItem('createRoomData', JSON.stringify({
+      roomName: lobbyName,
+      hostName: hostName,
+      hostId: hostId,
+      customCode: joinCode
     }));
     
     router.push('/lobby');
@@ -156,42 +203,84 @@ export default function Home() {
               </div>
             </div>
             
-            {/* Simplified Action Buttons */}
-            {!showJoinForm ? (
+            {/* Action Buttons/Forms */}
+            {!showHostForm && !showJoinForm ? (
               <div className="flex flex-col md:flex-row justify-center gap-6 mb-16">
-                <Link 
-                  href="/setup" 
+                <button 
+                  onClick={() => setShowHostForm(true)}
                   className="flex items-center justify-center px-8 py-4 text-xl bg-blue-700 hover:bg-blue-600 text-white font-bold rounded-md transition-all relative overflow-hidden group"
                 >
-                  <span className="relative z-10">CREATE ROOM</span>
+                  <span className="relative z-10">HOST GAME</span>
                   <span className="absolute inset-0 bg-gradient-to-r from-blue-600 to-blue-800 transform scale-x-0 group-hover:scale-x-100 transition-transform origin-left"></span>
-                </Link>
+                </button>
                 <button 
                   onClick={() => setShowJoinForm(true)}
                   className="flex items-center justify-center px-8 py-4 text-xl bg-gray-800 hover:bg-gray-700 text-white font-bold rounded-md transition-all relative overflow-hidden group"
                 >
-                  <span className="relative z-10">JOIN ROOM</span>
+                  <span className="relative z-10">JOIN GAME</span>
                   <span className="absolute inset-0 bg-gradient-to-r from-gray-700 to-gray-900 transform scale-x-0 group-hover:scale-x-100 transition-transform origin-left"></span>
                 </button>
               </div>
-            ) : (
+            ) : showHostForm ? (
               <div className="max-w-md mx-auto bg-gray-900/80 backdrop-blur-sm rounded-lg p-6 border border-blue-900/50 mb-16">
-                <h3 className="text-xl font-bold mb-4 text-center text-blue-400">Join a Room</h3>
-                <form onSubmit={handleJoinRoom} className="space-y-4">
+                <h3 className="text-xl font-bold mb-4 text-center text-blue-400">Host a Game</h3>
+                <form onSubmit={handleHostRoom} className="space-y-4">
                   <div>
-                    <label className="block text-sm font-medium mb-1" htmlFor="playerName">
-                      Your Name
+                    <label className="block text-sm font-medium mb-1" htmlFor="lobbyName">
+                      Lobby Name
                     </label>
                     <input
-                      id="playerName"
+                      id="lobbyName"
                       type="text"
-                      value={playerName}
-                      onChange={(e) => setPlayerName(e.target.value)}
-                      placeholder="Enter your name"
+                      value={lobbyName}
+                      onChange={(e) => setLobbyName(e.target.value)}
+                      placeholder="Enter lobby name"
                       className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
                     />
                   </div>
                   
+                  <div>
+                    <label className="block text-sm font-medium mb-1" htmlFor="hostName">
+                      Host Name
+                    </label>
+                    <input
+                      id="hostName"
+                      type="text"
+                      value={hostName}
+                      onChange={(e) => setHostName(e.target.value)}
+                      placeholder="Enter your name"
+                      className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    />
+                    
+                    {hostError && (
+                      <p className="mt-1 text-red-400 text-xs">{hostError}</p>
+                    )}
+                  </div>
+                  
+                  <div className="flex gap-3">
+                    <button
+                      type="submit"
+                      className="flex-1 py-3 bg-blue-700 hover:bg-blue-600 rounded-md font-medium"
+                    >
+                      Create Lobby
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowHostForm(false);
+                        setHostError('');
+                      }}
+                      className="py-3 px-4 bg-gray-700 hover:bg-gray-600 rounded-md"
+                    >
+                      Back
+                    </button>
+                  </div>
+                </form>
+              </div>
+            ) : (
+              <div className="max-w-md mx-auto bg-gray-900/80 backdrop-blur-sm rounded-lg p-6 border border-blue-900/50 mb-16">
+                <h3 className="text-xl font-bold mb-4 text-center text-blue-400">Join a Game</h3>
+                <form onSubmit={handleJoinRoom} className="space-y-4">
                   <div>
                     <label className="block text-sm font-medium mb-1" htmlFor="gameCode">
                       Room Code
@@ -205,6 +294,20 @@ export default function Home() {
                       className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600 uppercase"
                       maxLength={6}
                     />
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium mb-1" htmlFor="playerName">
+                      Your Name
+                    </label>
+                    <input
+                      id="playerName"
+                      type="text"
+                      value={playerName}
+                      onChange={(e) => setPlayerName(e.target.value)}
+                      placeholder="Enter your name"
+                      className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    />
                     
                     {joinError && (
                       <p className="mt-1 text-red-400 text-xs">{joinError}</p>
@@ -216,11 +319,14 @@ export default function Home() {
                       type="submit"
                       className="flex-1 py-3 bg-blue-700 hover:bg-blue-600 rounded-md font-medium"
                     >
-                      Join Room
+                      Join Game
                     </button>
                     <button
                       type="button"
-                      onClick={() => setShowJoinForm(false)}
+                      onClick={() => {
+                        setShowJoinForm(false);
+                        setJoinError('');
+                      }}
                       className="py-3 px-4 bg-gray-700 hover:bg-gray-600 rounded-md"
                     >
                       Back
@@ -241,14 +347,28 @@ export default function Home() {
 
       {/* Add custom styles for animations */}
       <style jsx global>{`
-        @keyframes loadingBar {
-          0% { width: 0; }
-          50% { width: 100%; }
-          100% { width: 0; }
+        @keyframes pulse {
+          0% { opacity: 0.1; }
+          50% { opacity: 0.4; }
+          100% { opacity: 0.1; }
         }
         
-        .animate-loading-bar {
-          animation: loadingBar 2s ease-in-out infinite;
+        @keyframes blink {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0; }
+        }
+        
+        .animate-blink {
+          animation: blink 1.2s steps(1) infinite;
+        }
+        
+        .bg-scanlines {
+          background-image: repeating-linear-gradient(
+            transparent 0px,
+            rgba(0, 0, 0, 0.05) 1px,
+            transparent 2px,
+            transparent 4px
+          );
         }
         
         .glitch-title {
@@ -264,50 +384,42 @@ export default function Home() {
           left: 0;
           width: 100%;
           height: 100%;
+          opacity: 0.8;
         }
         
         .glitch-title::before {
-          color: #ef4444;
+          color: #ff0055;
           z-index: -1;
-          animation: glitch-animation 3.5s infinite linear alternate-reverse;
+          animation: glitch 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94) both infinite;
+          animation-delay: 0.1s;
         }
         
         .glitch-title::after {
-          color: #93c5fd;
+          color: #00ffff;
           z-index: -2;
-          animation: glitch-animation 2s infinite linear alternate-reverse;
+          animation: glitch 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94) reverse both infinite;
+          animation-delay: 0.2s;
         }
         
-        @keyframes glitch-animation {
-          0% { transform: translate(-2px, 2px); }
-          20% { transform: translate(1px, 1px); }
-          40% { transform: translate(-1px, -3px); }
-          60% { transform: translate(3px, 2px); }
-          80% { transform: translate(-2px, -2px); }
-          100% { transform: translate(2px, 3px); }
-        }
-        
-        @keyframes blink {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0; }
-        }
-        
-        @keyframes pulse {
-          0% { opacity: 0.2; }
-          100% { opacity: 0.4; }
-        }
-        
-        .animate-blink {
-          animation: blink 1s infinite;
-        }
-        
-        .bg-scanlines {
-          background: linear-gradient(
-            to bottom,
-            transparent 50%,
-            rgba(0, 0, 0, 0.3) 50%
-          );
-          background-size: 100% 4px;
+        @keyframes glitch {
+          0% {
+            transform: translate(0);
+          }
+          20% {
+            transform: translate(-2px, 2px);
+          }
+          40% {
+            transform: translate(-2px, -2px);
+          }
+          60% {
+            transform: translate(2px, 2px);
+          }
+          80% {
+            transform: translate(2px, -2px);
+          }
+          100% {
+            transform: translate(0);
+          }
         }
       `}</style>
     </div>
